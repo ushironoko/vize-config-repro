@@ -1,0 +1,9 @@
+{
+  "name": "vize-config-repro",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@11.0.9",
+  "devDependencies": {
+    "@typescript/native-preview": "7.0.0-dev.20260522.1"
+  }
+}
