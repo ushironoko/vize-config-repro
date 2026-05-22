@@ -6,14 +6,13 @@ settings:
 
 importers:
 
-  .:
+  .: {}
+
+  apps/app:
     devDependencies:
       '@typescript/native-preview':
         specifier: 7.0.0-dev.20260522.1
         version: 7.0.0-dev.20260522.1
-
-  apps/app:
-    devDependencies:
       vize:
         specifier: 0.114.0
         version: 0.114.0
