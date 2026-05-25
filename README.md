@@ -1,15 +1,29 @@
 # vize-config-repro
 
-Minimal reproduction for four issues in vize `0.114.0` CLI:
+Minimal reproduction repo for issues observed in the vize CLI (`vize lint` / `vize check`).
 
-1. `vize lint` ignores `linter.rules` in `vize.config.{ts,json}`
-2. `vize check` does not suppress base TS diagnostics via `typeChecker.*` or `--no-check-*` flags
-3. `vize check` ignores `--corsa-path` / `CORSA_PATH`
-4. `vize check` cannot locate `tsgo` when a pnpm workspace child has `@typescript/native-preview` but no platform-specific binary in its local `node_modules`
+## Current issue (v0.124.0) — Options API SFC generates invalid virtual TS
+
+`vize check` generates invalid TypeScript when a Vue SFC uses Options API style
+(`<script lang="ts">` + `export default defineComponent({ ... })`), causing TS1128
+parse errors that cannot be silenced by any user-side configuration.
+
+See [Repro 5](#repro-5--vize-check-strips-the-export-keyword-when-generating-virtual-ts-for-options-api-sfc) below.
+
+## Historical issues (v0.114.0, all FIXED in v0.124.0)
+
+1. `vize lint` ignored `linter.rules` — **FIXED**
+2. `vize check` did not suppress base TS diagnostics via `typeChecker.*` — **FIXED**
+3. `vize check` ignored `--corsa-path` / `CORSA_PATH` — **FIXED**
+4. `vize check` could not locate `tsgo` when only the workspace root had
+   `@typescript/native-preview` — **FIXED**
+
+The reproduction file layout for the historical issues is preserved (see
+[`apps/app`](apps/app)) but the behaviors no longer reproduce on `vize@0.124.0`.
 
 ## Environment
 
-- vize `0.114.0` (npm)
+- vize `0.124.0` (npm)
 - @typescript/native-preview `7.0.0-dev.20260522.1`
 - pnpm `11.0.9`
 - Node `>=22`
@@ -21,67 +35,27 @@ Minimal reproduction for four issues in vize `0.114.0` CLI:
 pnpm install --config.minimumReleaseAge=0
 ```
 
-`minimumReleaseAge` override is only needed if pnpm's freshness policy is active in your environment.
-
-The default state of this repo reproduces all four issues. No additional setup is required.
-
 ---
 
-## Repro 1 — `vize lint` ignores `linter.rules`
+## Repro 5 — `vize check` strips the `export` keyword when generating virtual TS for Options API SFC
 
-`apps/app/vize.config.ts`:
+`apps/app/src/OptionsApi.vue`:
 
-```ts
-linter: {
-  preset: "happy-path",
-  rules: {
-    "vue/prop-name-casing": "off",
-    "vue/attribute-hyphenation": "off",
-  },
-}
+```vue
+<script lang="ts">
+import { defineComponent } from "vue";
+
+export default defineComponent({
+  name: "OptionsApi",
+});
+</script>
+
+<template>
+  <div>hello</div>
+</template>
 ```
 
 Run:
-
-```bash
-pnpm --filter app lint:vize
-```
-
-### Expected
-
-`0 warnings` — both rules are set to `off`.
-
-### Actual
-
-```
-[vize:vue/prop-name-casing] Prop 'countTotal' should be 'count-total' (kebab-case)
-[vize:vue/attribute-hyphenation] Attribute should be hyphenated
-
-2 warnings in 2 files
-```
-
-`vize lint --help` lists `--config` as "not yet implemented". Auto-discovery and explicit `-c vize.config.ts` produce identical results.
-
----
-
-## Repro 2 — `vize check` does not suppress diagnostics via `typeChecker.*` or `--no-check-*`
-
-`apps/app/vize.config.ts` disables every Vue-specific check:
-
-```ts
-typeChecker: {
-  enabled: true,
-  checkProps: false,
-  checkEmits: false,
-  checkTemplateBindings: false,
-  checkReactivity: false,
-  checkSetupContext: false,
-  checkInvalidExports: false,
-  checkFallthroughAttrs: false,
-}
-```
-
-Run (requires Repro 4 to be worked around first — see below):
 
 ```bash
 pnpm --filter app typecheck:vize
@@ -89,116 +63,53 @@ pnpm --filter app typecheck:vize
 
 ### Expected
 
-`No type errors found!` if `checkProps`/`checkTemplateBindings` actually gate the diagnostic, or at least the same behavior whether the option is `true` or `false`.
+`No type errors found!`
 
 ### Actual
 
 ```
-src/Parent.vue
-  error:8:18 [TS2322] Type 'string' is not assignable to type 'number'.
+src/OptionsApi.vue
+  error:4:1 [TS1128] Declaration or statement expected.
 
 1 error(s)
 ```
 
-Same diagnostic appears with CLI flags:
+### Root cause (verified)
+
+Inspect the virtual TS via `--show-virtual-ts`:
 
 ```bash
-pnpm --filter app exec vize check "src/**/*.vue" \
-  --tsconfig tsconfig.json \
-  --no-check-props \
-  --no-check-template-bindings
+pnpm --filter app exec vize check src/OptionsApi.vue \
+  --tsconfig tsconfig.json --show-virtual-ts | head -80
 ```
 
-The `typeChecker.*` settings and `--no-check-*` flags do not change output. Either they are not read, or the option names suggest they control prop / template-binding type checking but only gate extra Vue-specific checks while leaving base TS diagnostics unaffected. <https://vizejs.dev/guide/configuration/index.html> describes the settings without that caveat.
+Around the `// User setup code` section, the virtual TS contains:
 
----
+```ts
+// User setup code
 
-## Repro 3 — `vize check` ignores `--corsa-path` and `CORSA_PATH`
 
-This repro relies on Repro 4's setup (workspace child has incomplete `native-preview`).
-
-The platform binary actually exists at:
-
-```
-node_modules/.pnpm/@typescript+native-preview-darwin-arm64@<ver>/node_modules/@typescript/native-preview-darwin-arm64/lib/tsgo
+  default defineComponent({
+    name: "OptionsApi",
+  });
 ```
 
-Pass it explicitly:
+`vize check` has copied the user's `<script>` body into the synthetic
+`__setup()` function but **stripped the `export` keyword** from
+`export default defineComponent({...})`, leaving a bare `default` token.
+`default` is a reserved keyword and only valid as a modifier on `export`,
+so the TypeScript parser emits TS1128 at the line.
 
-```bash
-TSGO=$(find node_modules/.pnpm -name tsgo -path "*native-preview-darwin-arm64*" | head -1)
-pnpm --filter app exec vize check "src/**/*.vue" \
-  --tsconfig tsconfig.json \
-  --corsa-path "$TSGO"
-```
+The same pattern repeats once per Options API SFC, so a project with many
+classic `<script>` + `export default defineComponent` files (Tiptap node
+views, Vue 2-style components, etc.) accumulates hundreds of false-positive
+parse errors that no `typeChecker.*` setting or `--no-check-*` flag can
+suppress.
 
-### Expected
+### File layout
 
-vize check uses the binary at `$TSGO` and runs to completion.
-
-### Actual
-
-```
-vize check requires '@typescript/native-preview' to be installed.
-```
-
-Same when using `CORSA_PATH=$TSGO pnpm --filter app typecheck:vize`. The `--corsa-path` flag is parsed but not threaded into `CorsaExecutor::new` (see `crates/vize_canon/src/batch/executor.rs`). Only the project-session client honors it.
-
-(The legacy `--tsgo-path` flag has been removed in `0.114.0`; the help even suggests `--corsa-path` instead, yet `--corsa-path` itself does not work for the batch path.)
-
----
-
-## Repro 4 — `vize check` fails when only the workspace child has `@typescript/native-preview`
-
-`apps/app/package.json` depends on `@typescript/native-preview`. pnpm installs the bare entry locally:
-
-```
-apps/app/node_modules/@typescript/native-preview/lib/
-├── getExePath.d.ts
-└── getExePath.js          # no tsgo binary here
-```
-
-The platform-specific binary lives only at the workspace root:
-
-```
-node_modules/.pnpm/@typescript+native-preview-darwin-arm64@<ver>/node_modules/@typescript/native-preview-darwin-arm64/lib/tsgo
-```
-
-Run:
-
-```bash
-pnpm --filter app typecheck:vize
-```
-
-### Expected
-
-vize check climbs up from `apps/app` to the workspace root, finds the platform binary in `node_modules/.pnpm/...`, and runs.
-
-### Actual
-
-```
-vize check requires '@typescript/native-preview' to be installed.
-```
-
-The error is misleading — `@typescript/native-preview` _is_ installed; `@typescript/native-preview-darwin-arm64` (the platform binary host) is just not hoisted into `apps/app/node_modules`.
-
-`crates/vize_canon/src/lsp_client/paths.rs::find_corsa_in_search_roots` boundary-checks at `project_root`, so a hoisted dependency above the app directory is unreachable.
-
-### Workaround
-
-Add the platform binary to the workspace child:
-
-```bash
-pnpm --filter app add -D @typescript/native-preview-darwin-arm64 --config.minimumReleaseAge=0
-```
-
-After this, `pnpm --filter app typecheck:vize` runs successfully — and then Repro 2 becomes observable on the same diagnostic.
-
----
-
-## File layout
-
-- `apps/app/vize.config.ts` — config that should be honored
-- `apps/app/src/Child.vue` — `defineProps<{ countTotal: number }>()`
-- `apps/app/src/Parent.vue` — passes `:countTotal="wrong"` where `wrong: string`
-- `apps/app/package.json` — `lint:vize` / `typecheck:vize` scripts, depends only on `@typescript/native-preview` (no `-<platform>` entry)
+- [`apps/app/src/OptionsApi.vue`](apps/app/src/OptionsApi.vue) — minimal failing case
+- [`apps/app/src/Child.vue`](apps/app/src/Child.vue) — props-defining child (`<script setup>` style, passes)
+- [`apps/app/src/Parent.vue`](apps/app/src/Parent.vue) — uses Child (`<script setup>` style, passes)
+- [`apps/app/vize.config.ts`](apps/app/vize.config.ts) — config kept from historical reproductions
+- [`apps/app/package.json`](apps/app/package.json) — `lint:vize` / `typecheck:vize` scripts
