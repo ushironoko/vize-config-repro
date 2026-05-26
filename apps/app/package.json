@@ -9,7 +9,7 @@
   },
   "devDependencies": {
     "@typescript/native-preview": "7.0.0-dev.20260522.1",
-    "vize": "0.126.0",
+    "vize": "0.133.0",
     "vue": "3.5.34"
   }
 }

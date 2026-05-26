@@ -2,21 +2,32 @@
 
 Minimal reproduction repo for issues observed in the vize CLI (`vize lint` / `vize check`).
 
-## Current issues (v0.126.0)
+## Current issue (v0.133.0)
 
-After the Options API parse-error fix (`ubugeeei/vize#613`, released as
-`v0.126.0`), two issues remain in `vize check`:
+After the kebab-case / vue-stub fix (`ubugeeei/vize#641`, released as
+`v0.133.0`), one issue remains in `vize check`:
+
+- [Repro 8](#repro-8--vize-check-splits-script-setup-type-and-value-declarations-into-different-scopes):
+  `vize check` places `type` declarations from `<script setup>` into
+  the **module scope** while keeping value declarations (`const`,
+  `function`) inside the synthetic `__setup()` function. Patterns
+  like `type X = (typeof someConst)[number]` therefore lose access to
+  `someConst` and emit `TS2304 Cannot find name` / `TS2552 Did you
+  mean...?`.
+
+## Historical issues — kebab components / vue stubs (v0.126.0, FIXED in v0.133.0)
+
+Two issues introduced (or unmasked) by the v0.126.0 Options API
+parse-error fix were addressed by `ubugeeei/vize#641` in `v0.133.0`:
 
 - [Repro 6](#repro-6--vize-check-emits-unsanitised-kebab-case-component-identifiers-into-virtual-ts):
-  templates using kebab-case component names (e.g. `<router-link>`,
-  `<my-widget>`) cause `vize check` to emit identifiers containing `-`
-  into the generated virtual TS (`type __router-link_Props_0 = ...`),
-  producing TS1005 / TS1128 / TS1109 / TS1434 syntax errors.
+  templates using kebab-case component names emitted identifiers
+  containing `-` into the generated virtual TS, producing
+  TS1005 / TS1128 / TS1109 / TS1434 syntax errors — **FIXED**.
 - [Repro 7](#repro-7--vize-check-cannot-resolve-named-exports-from-vue-in-options-api-virtual-ts):
-  `vize check` reports `TS2724 '"vue"' has no exported member named
-  'defineComponent'` for `<script lang="ts"> + import { defineComponent } from "vue"`,
-  even though `tsgo --noEmit` over the same workspace resolves the same
-  import without error.
+  `import { defineComponent } from "vue"` in Options API SFCs raised
+  `TS2724 '"vue"' has no exported member named 'defineComponent'`,
+  while `tsgo --noEmit` over the same workspace passed — **FIXED**.
 
 ## Historical issues — Options API parse error (v0.124.0, FIXED in v0.126.0)
 
@@ -38,7 +49,7 @@ The reproduction file layout for the historical issues is preserved (see
 
 ## Environment
 
-- vize `0.126.0` (npm)
+- vize `0.133.0` (npm)
 - @typescript/native-preview `7.0.0-dev.20260522.1`
 - pnpm `11.0.9`
 - Node `>=22`
@@ -274,3 +285,99 @@ under a different anchor than the real `apps/app/tsconfig.json` rootDir.
 - [`apps/app/src/OptionsApi.vue`](apps/app/src/OptionsApi.vue) — failing SFC (same file as Repro 5)
 - [`apps/app/src/ts-only.ts`](apps/app/src/ts-only.ts) — same `import` from a plain `.ts` file, used as the cross-check
 - [`apps/app/tsconfig.json`](apps/app/tsconfig.json) — shared config (`moduleResolution: "Bundler"`)
+
+---
+
+## Repro 8 — `vize check` splits `<script setup>` type and value declarations into different scopes
+
+`apps/app/src/TypeofConst.vue`:
+
+```vue
+<script setup lang="ts">
+type Name = (typeof names)[number]
+
+const names = ['a', 'b', 'c'] as const
+
+const value: Name = 'a'
+</script>
+
+<template>
+  <div>{{ value }}</div>
+</template>
+```
+
+Run:
+
+```bash
+pnpm --filter app exec vize check src/TypeofConst.vue --tsconfig tsconfig.json
+```
+
+### Expected
+
+`No type errors found!`
+
+### Actual
+
+```
+src/TypeofConst.vue
+  error:2:21 [TS2552] Cannot find name 'names'. Did you mean 'name'?
+```
+
+### Cross-check — `tsgo` over the same pattern in a plain `.ts` file passes
+
+[`apps/app/src/ts-only.ts`](apps/app/src/ts-only.ts) contains the same
+declaration pattern:
+
+```ts
+type _Name = (typeof _names)[number]
+const _names = ['a', 'b', 'c'] as const
+export const _value: _Name = 'a'
+```
+
+```bash
+pnpm --filter app exec tsgo --noEmit --project tsconfig.json
+# (exits 0, no diagnostics)
+```
+
+The forward `typeof` reference from a `type` alias to a later `const`
+is a standard TS pattern and resolves correctly under `tsgo` directly.
+The failure only appears when `vize check` generates the virtual TS for
+a `<script setup>` block.
+
+### Root cause (verified)
+
+Inspect the virtual TS with `--show-virtual-ts`. `vize check` lifts
+`type` declarations from the user's `<script setup>` into the
+**module scope** of the generated TS, while keeping `const` / `function`
+value declarations inside the synthetic `__setup()` function:
+
+```ts
+// ========== Module Scope (imports) ==========
+// (lifted from <script setup>)
+type Name = (typeof names)[number]      // ❌ `names` is not in scope here
+
+// ========== Setup Scope ==========
+function __setup() {
+  // User setup code
+  const names = ['a', 'b', 'c'] as const  // ← defined inside __setup()
+  const value: Name = 'a'
+  ...
+}
+```
+
+Because `typeof names` is a **value-space** reference (even though it
+appears in a type position), it must be resolved against in-scope value
+bindings. Splitting the two declarations across scopes breaks that
+resolution and emits `TS2304` / `TS2552` for the typeof'd identifier.
+
+In a realistic codebase any `<script setup>` block that derives a type
+from a sibling `as const` array — a very common pattern for narrowed
+string-literal unions — produces a false-positive diagnostic for every
+typeof'd identifier. The failure scales with usage; a real project saw
+**~7400 TS2304 + ~1084 TS2552 diagnostics across ~1966 SFCs**, none of
+which `vue-tsc` or `tsgo` reproduce on the same sources.
+
+### File layout
+
+- [`apps/app/src/TypeofConst.vue`](apps/app/src/TypeofConst.vue) — minimal failing case
+- [`apps/app/src/ts-only.ts`](apps/app/src/ts-only.ts) — same `typeof`-`const` pattern in a plain `.ts` file, used as the cross-check
