@@ -5,8 +5,7 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "jsx": "preserve",
-    "skipLibCheck": true,
-    "types": ["vue"]
+    "skipLibCheck": true
   },
   "include": ["src/**/*.vue", "src/**/*.ts"]
 }
