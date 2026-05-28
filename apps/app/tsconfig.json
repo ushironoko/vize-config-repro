@@ -5,7 +5,11 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "jsx": "preserve",
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    }
   },
   "include": ["src/**/*.vue", "src/**/*.ts"]
 }

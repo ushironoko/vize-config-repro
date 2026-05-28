@@ -2,18 +2,41 @@
 
 Minimal reproduction repo for issues observed in the vize CLI (`vize lint` / `vize check`).
 
-## Current issue (v0.133.0)
+## Current issues (v0.134.0)
 
-After the kebab-case / vue-stub fix (`ubugeeei/vize#641`, released as
-`v0.133.0`), one issue remains in `vize check`:
+After the typeof-anchored-types fix (`ubugeeei/vize#644`, released as
+`v0.134.0`), four issues remain in `vize check`. All four pass under
+`tsgo --noEmit` over the same workspace, so they are specific to the
+virtual TS that `vize check` generates.
 
-- [Repro 8](#repro-8--vize-check-splits-script-setup-type-and-value-declarations-into-different-scopes):
-  `vize check` places `type` declarations from `<script setup>` into
-  the **module scope** while keeping value declarations (`const`,
-  `function`) inside the synthetic `__setup()` function. Patterns
-  like `type X = (typeof someConst)[number]` therefore lose access to
-  `someConst` and emit `TS2304 Cannot find name` / `TS2552 Did you
-  mean...?`.
+- [Repro 9](#repro-9--vize-check-does-not-load-ambient-declare-global-types):
+  ambient types from a `.d.ts` (`declare global { type X }`) are not
+  visible inside the generated virtual TS, so an SFC using `X` emits
+  `TS2304 Cannot find name 'X'`.
+- [Repro 10](#repro-10--vize-check-traps-script-setup-re-export-statements-inside-__setup):
+  a re-export statement in `<script setup>` (`export { X }` /
+  `export type { X }`) is emitted **inside** the synthetic `__setup()`
+  function, producing `TS1233` / `TS2303` on the provider and
+  `TS2614` on any consumer. Declaration exports (`export interface X`,
+  `export type X = ...`) are lifted correctly and are unaffected.
+- [Repro 11](#repro-11--vize-check-loses-script-setup-generic-type-parameters-in-type-declarations):
+  in a `<script setup generic="T">` SFC, `type` declarations referencing
+  the generic parameter `T` are lifted to the module scope while `T`
+  only exists on `function __setup<T>()`, so `type Option = { key: T }`
+  emits `TS2304 Cannot find name 'T'`. (A residual case of the Repro 8
+  fix.)
+- [Repro 12](#repro-12--vize-check-cannot-resolve-named-exports-from-vue-imported-via-a-path-alias):
+  importing a `.vue` named export through a tsconfig `paths` alias
+  (`@/Foo.vue`) falls back to the ambient `*.vue` stub and emits
+  `TS2614`; the same import via a relative path resolves correctly.
+
+## Historical issues — typeof-anchored types (v0.133.0, FIXED in v0.134.0)
+
+`vize check` placed `type` declarations from `<script setup>` into the
+module scope while keeping value declarations inside `__setup()`, so
+`type X = (typeof someConst)[number]` lost access to `someConst` and
+emitted `TS2304` / `TS2552`. Addressed by `ubugeeei/vize#644`. See
+[Repro 8](#repro-8--vize-check-splits-script-setup-type-and-value-declarations-into-different-scopes).
 
 ## Historical issues — kebab components / vue stubs (v0.126.0, FIXED in v0.133.0)
 
@@ -49,7 +72,7 @@ The reproduction file layout for the historical issues is preserved (see
 
 ## Environment
 
-- vize `0.133.0` (npm)
+- vize `0.134.0` (npm)
 - @typescript/native-preview `7.0.0-dev.20260522.1`
 - pnpm `11.0.9`
 - Node `>=22`
@@ -381,3 +404,313 @@ which `vue-tsc` or `tsgo` reproduce on the same sources.
 
 - [`apps/app/src/TypeofConst.vue`](apps/app/src/TypeofConst.vue) — minimal failing case
 - [`apps/app/src/ts-only.ts`](apps/app/src/ts-only.ts) — same `typeof`-`const` pattern in a plain `.ts` file, used as the cross-check
+
+---
+
+## Repro 9 — `vize check` does not load ambient `declare global` types
+
+`apps/app/src/@types/globals.d.ts`:
+
+```ts
+declare global {
+  type GlobalTabType = 'default' | 'wireframes' | 'liked'
+}
+
+export {}
+```
+
+`apps/app/src/UseGlobalType.vue`:
+
+```vue
+<script setup lang="ts">
+const tab: GlobalTabType = 'default'
+</script>
+
+<template>
+  <div>{{ tab }}</div>
+</template>
+```
+
+Run:
+
+```bash
+pnpm --filter app exec vize check src/UseGlobalType.vue --tsconfig tsconfig.json
+```
+
+### Expected
+
+`No type errors found!`
+
+### Actual
+
+```
+src/UseGlobalType.vue
+  error:2:12 [TS2304] Cannot find name 'GlobalTabType'.
+```
+
+### Cross-check — `tsgo` resolves the ambient type
+
+```bash
+pnpm --filter app exec tsgo --noEmit --project tsconfig.json
+# (exits 0, no diagnostics)
+```
+
+`tsconfig.json` includes `src/**/*.ts` (which matches `.d.ts`), so the
+global declaration is in the program. `tsgo` resolves `GlobalTabType`
+fine; only the `vize check` virtual TS fails to see it, indicating the
+ambient `.d.ts` is not added to the corsa virtual project.
+
+### File layout
+
+- [`apps/app/src/@types/globals.d.ts`](apps/app/src/@types/globals.d.ts) — ambient global type
+- [`apps/app/src/UseGlobalType.vue`](apps/app/src/UseGlobalType.vue) — minimal failing case
+
+---
+
+## Repro 10 — `vize check` traps `<script setup>` re-export statements inside `__setup()`
+
+`apps/app/src/ReExportType.ts`:
+
+```ts
+export type FilterType = 'image' | 'text'
+```
+
+`apps/app/src/ReExportType.vue` (provider):
+
+```vue
+<script setup lang="ts">
+import { type FilterType } from './ReExportType'
+
+export type { FilterType }
+
+defineProps<{ kind?: FilterType }>()
+</script>
+
+<template>
+  <div />
+</template>
+```
+
+`apps/app/src/ReExportTypeConsumer.vue` (consumer):
+
+```vue
+<script setup lang="ts">
+import ReExportType, { type FilterType } from './ReExportType.vue'
+
+const v: FilterType = 'image'
+</script>
+
+<template>
+  <ReExportType :kind="v" />
+</template>
+```
+
+Run:
+
+```bash
+pnpm --filter app exec vize check src/ReExportType.vue src/ReExportTypeConsumer.vue --tsconfig tsconfig.json
+```
+
+### Expected
+
+`No type errors found!`
+
+### Actual
+
+```
+src/ReExportType.vue
+  error:4:1 [TS1233] An export declaration can only be used at the top level of a namespace or module.
+  error:4:15 [TS2303] Circular definition of import alias 'FilterType'.
+src/ReExportTypeConsumer.vue
+  error:2:29 [TS2614] Module '"./ReExportType.vue.ts"' has no exported member 'FilterType'. ...
+```
+
+### Root cause (verified)
+
+Inspect the provider's virtual TS with `--show-virtual-ts`. The
+re-export statement is emitted **inside** the synthetic `__setup()`
+function:
+
+```ts
+// ========== Module Scope (imports) ==========
+import { type FilterType } from './ReExportType'
+export type Props = { kind?: FilterType };
+
+// ========== Setup Scope ==========
+function __setup() {
+  export type { FilterType }      // ❌ export not valid inside a function
+  ...
+}
+```
+
+`export` statements are only valid at module top level, so TS emits
+`TS1233`, and the alias collides with the module-scope import producing
+`TS2303`. The named export is therefore dropped from the virtual module,
+and any consumer that does `import { type FilterType } from './X.vue'`
+sees `TS2614`.
+
+Declaration exports are handled differently and are **not** affected —
+see the passing control case in
+[`NamedExport.vue`](apps/app/src/NamedExport.vue) (`export interface
+TabConfig`), which is lifted to the module scope correctly.
+
+### File layout
+
+- [`apps/app/src/ReExportType.ts`](apps/app/src/ReExportType.ts) — the type source
+- [`apps/app/src/ReExportType.vue`](apps/app/src/ReExportType.vue) — provider re-exporting via `export type { ... }` (fails)
+- [`apps/app/src/ReExportTypeConsumer.vue`](apps/app/src/ReExportTypeConsumer.vue) — consumer (sees `TS2614`)
+- [`apps/app/src/NamedExport.vue`](apps/app/src/NamedExport.vue) — control: declaration export (`export interface`) passes
+- [`apps/app/src/NamedExportConsumer.vue`](apps/app/src/NamedExportConsumer.vue) — control consumer (passes)
+
+---
+
+## Repro 11 — `vize check` loses `<script setup>` generic type parameters in type declarations
+
+`apps/app/src/Generic.vue`:
+
+```vue
+<script setup lang="ts" generic="T extends string">
+type Option = { key: T; label: string }
+
+defineProps<{
+  options: Option[]
+  current: T | undefined
+}>()
+</script>
+
+<template>
+  <ul>
+    <li v-for="o in options" :key="o.key">{{ o.label }}</li>
+  </ul>
+</template>
+```
+
+Run:
+
+```bash
+pnpm --filter app exec vize check src/Generic.vue --tsconfig tsconfig.json
+```
+
+### Expected
+
+`No type errors found!`
+
+### Actual
+
+```
+src/Generic.vue
+  error:2:22 [TS2304] Cannot find name 'T'.
+```
+
+### Root cause (verified)
+
+Inspect the virtual TS with `--show-virtual-ts`. The user's `type Option`
+is lifted to the module scope, but the generic parameter `T` only exists
+on the `__setup` function signature:
+
+```ts
+// ========== Module Scope (imports) ==========
+type Option = { key: T; label: string }   // ❌ T is not in scope here
+
+// ========== Setup Scope ==========
+function __setup<T extends string>() {     // ← T only lives here
+  defineProps<{ options: Option[]; current: T | undefined }>()
+  ...
+}
+```
+
+This is a residual case of the Repro 8 fix: ordinary `<script setup>`
+type declarations now stay inside `__setup()`, but for a
+`generic="..."` SFC the type declaration is still lifted to the module
+scope, separating it from the generic parameter it depends on.
+
+### File layout
+
+- [`apps/app/src/Generic.vue`](apps/app/src/Generic.vue) — minimal failing case
+
+---
+
+## Repro 12 — `vize check` cannot resolve named exports from `.vue` imported via a path alias
+
+`apps/app/tsconfig.json` declares a `paths` alias:
+
+```jsonc
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/*"] }
+  }
+}
+```
+
+`apps/app/src/AliasProvider.vue`:
+
+```vue
+<script setup lang="ts">
+export interface AliasConfig {
+  key: string
+  label: string
+}
+
+defineProps<{ configs: AliasConfig[] }>()
+</script>
+
+<template>
+  <div />
+</template>
+```
+
+`apps/app/src/AliasConsumer.vue`:
+
+```vue
+<script setup lang="ts">
+import AliasProvider, { type AliasConfig } from '@/AliasProvider.vue'
+
+const configs: AliasConfig[] = [{ key: 'a', label: 'A' }]
+</script>
+
+<template>
+  <AliasProvider :configs="configs" />
+</template>
+```
+
+Run:
+
+```bash
+pnpm --filter app exec vize check src/AliasProvider.vue src/AliasConsumer.vue --tsconfig tsconfig.json
+```
+
+### Expected
+
+`No type errors found!`
+
+### Actual
+
+```
+src/AliasConsumer.vue
+  error:2:30 [TS2614] Module '"*.vue"' has no exported member 'AliasConfig'. Did you mean to use 'import AliasConfig from "*.vue"' instead?
+```
+
+### Cross-check — the same import via a relative path passes
+
+[`NamedExportConsumer.vue`](apps/app/src/NamedExportConsumer.vue) imports
+the same kind of declaration export from `./NamedExport.vue` using a
+**relative** path and passes:
+
+```bash
+pnpm --filter app exec vize check src/NamedExport.vue src/NamedExportConsumer.vue --tsconfig tsconfig.json
+# No type errors found!
+```
+
+Both the provider and consumer are passed to `vize check`; only the
+`paths`-alias form (`@/AliasProvider.vue`) fails. The error message
+references the ambient `*.vue` module, indicating `vize check` resolves
+the alias to the ambient stub instead of the alias target's generated
+virtual TS.
+
+### File layout
+
+- [`apps/app/tsconfig.json`](apps/app/tsconfig.json) — declares the `@/*` → `src/*` alias
+- [`apps/app/src/AliasProvider.vue`](apps/app/src/AliasProvider.vue) — provider (`export interface AliasConfig`)
+- [`apps/app/src/AliasConsumer.vue`](apps/app/src/AliasConsumer.vue) — consumer importing via `@/AliasProvider.vue` (fails)
+- [`apps/app/src/NamedExportConsumer.vue`](apps/app/src/NamedExportConsumer.vue) — control: same import via relative path (passes)
