@@ -2,6 +2,19 @@
 
 Minimal reproduction repo for issues observed in the vize CLI (`vize lint` / `vize check`).
 
+## Newly observed (v0.217.0+)
+
+After the Options API typed-`this` bridge was added (somewhere between
+`v0.206.0` and `v0.217.0`), an additional virtual-TS generation defect
+surfaces in a common Options API shape that combines five blocks at once.
+
+- [Repro 13](#repro-13--vize-check-emits-ts1xxx-on-options-api-sfcs-that-spread-an-external-props-object-alongside-setup--data--computed--methods):
+  an Options API SFC with `props: { ...<external const> }` **and**
+  `setup() { return { ... } }` **and** `data()` **and** `computed`
+  (using `this.*`) **and** `methods` (using `this.*`) makes `vize check`
+  emit four `TS1xxx` syntax errors (typically `TS1131` / `TS1128` /
+  `TS1109`). The same SFC type-checks cleanly under `vue-tsc --noEmit`.
+
 ## Current issues (v0.134.0)
 
 After the typeof-anchored-types fix (`ubugeeei/vize#644`, released as
@@ -714,3 +727,108 @@ virtual TS.
 - [`apps/app/src/AliasProvider.vue`](apps/app/src/AliasProvider.vue) — provider (`export interface AliasConfig`)
 - [`apps/app/src/AliasConsumer.vue`](apps/app/src/AliasConsumer.vue) — consumer importing via `@/AliasProvider.vue` (fails)
 - [`apps/app/src/NamedExportConsumer.vue`](apps/app/src/NamedExportConsumer.vue) — control: same import via relative path (passes)
+
+---
+
+## Repro 13 — `vize check` emits TS1xxx on Options API SFCs that spread an external props object alongside setup / data / computed / methods
+
+Observed against `vize@0.217.0` and `vize@0.219.0` with
+`@typescript/native-preview@7.0.0-dev.20260602.1`.
+
+[`apps/app/src/OptionsApiPropsSpread.vue`](apps/app/src/OptionsApiPropsSpread.vue):
+
+```vue
+<script lang="ts">
+import { defineComponent } from 'vue'
+
+const sharedProps = {
+  meta: { type: Object, required: true as const },
+}
+
+function useFakeStore() {
+  return { cached: (s: string, _b: boolean) => s }
+}
+
+export default defineComponent({
+  props: { ...sharedProps },
+  setup() {
+    const store = useFakeStore()
+    return { store }
+  },
+  data() {
+    return { missing: false }
+  },
+  computed: {
+    url() {
+      return this.store.cached('x', false)
+    },
+  },
+  methods: {
+    onError(_a: unknown) {
+      this.missing = true
+    },
+  },
+})
+</script>
+```
+
+Run:
+
+```bash
+pnpm --filter app exec vize check src/OptionsApiPropsSpread.vue --tsconfig tsconfig.json
+```
+
+### Expected
+
+`No type errors found!` — `vue-tsc --noEmit -p tsconfig.json` reports
+zero errors on this SFC.
+
+### Actual
+
+```
+src/OptionsApiPropsSpread.vue
+  error:12:63 [TS1131] Property or signature expected.
+  error:13:4  [TS1128] Declaration or statement expected.
+  error:13:5  [TS1109] Expression expected.
+  error:13:6  [TS1109] Expression expected.
+
+4 error(s)
+```
+
+The reported `line:column` positions point at the closing of the props
+block in the original SFC (`12:63` and `13:4-6`), but the source SFC at
+those positions is syntactically valid TypeScript — `vue-tsc` over the
+same file under the same `tsconfig.json` passes.
+
+### Trigger surface (bisected)
+
+Removing **any one** of the five elements below from the same SFC makes
+the four errors disappear. Inlining the props (writing
+`meta: { type: Object, required: true as const }` directly inside
+`props: { ... }`, with no `...spread`) also makes them disappear.
+
+1. `props: { ...<external const object> }` — props spread from an
+   outer-scope const
+2. `setup() { return { ... } }` — setup with a non-empty return
+3. `data()` returning at least one field
+4. `computed: { name() { return this.<setup-returned>.* } }` — a
+   computed that resolves `this.*` to a setup-returned member
+5. `methods: { name(arg) { this.<data-key> = ... } }` — a method that
+   writes to a `data()` field via `this`
+
+This is the shape that recurs in many real-world Options API SFCs
+(setup return + store cross-reference + data + this-mutating methods +
+shared props mixin), so the false-positive count scales with the number
+of such files in a project.
+
+### Cross-check — vue-tsc
+
+```bash
+pnpm --filter app exec vue-tsc --noEmit -p tsconfig.json 2>&1 \
+  | grep OptionsApiPropsSpread
+# (no output — vue-tsc reports no errors for this file)
+```
+
+### File layout
+
+- [`apps/app/src/OptionsApiPropsSpread.vue`](apps/app/src/OptionsApiPropsSpread.vue) — minimal 5-block reproduction (4 errors under `vize check`, 0 under `vue-tsc`)

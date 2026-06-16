@@ -5,11 +5,14 @@
   "type": "module",
   "scripts": {
     "lint:vize": "vize lint \"src/**/*.vue\"",
-    "typecheck:vize": "vize check \"src/**/*.vue\" --tsconfig tsconfig.json"
+    "typecheck:vize": "vize check \"src/**/*.vue\" --tsconfig tsconfig.json",
+    "typecheck:vue-tsc": "vue-tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
-    "@typescript/native-preview": "7.0.0-dev.20260522.1",
-    "vize": "0.134.0",
-    "vue": "3.5.34"
+    "@typescript/native-preview": "7.0.0-dev.20260602.1",
+    "typescript": "5.9.3",
+    "vize": "0.217.0",
+    "vue": "3.5.34",
+    "vue-tsc": "3.3.4"
   }
 }
