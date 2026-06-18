@@ -5,15 +5,24 @@ Minimal reproduction repo for issues observed in the vize CLI (`vize lint` / `vi
 ## Newly observed (v0.217.0+)
 
 After the Options API typed-`this` bridge was added (somewhere between
-`v0.206.0` and `v0.217.0`), an additional virtual-TS generation defect
-surfaces in a common Options API shape that combines five blocks at once.
+`v0.206.0` and `v0.217.0`), virtual-TS generation defects surface in
+several common Options API shapes.
 
-- [Repro 13](#repro-13--vize-check-emits-ts1xxx-on-options-api-sfcs-that-spread-an-external-props-object-alongside-setup--data--computed--methods):
-  an Options API SFC with `props: { ...<external const> }` **and**
-  `setup() { return { ... } }` **and** `data()` **and** `computed`
-  (using `this.*`) **and** `methods` (using `this.*`) makes `vize check`
-  emit four `TS1xxx` syntax errors (typically `TS1131` / `TS1128` /
-  `TS1109`). The same SFC type-checks cleanly under `vue-tsc --noEmit`.
+- [Repro 13](#repro-13--vize-check-emits-ts1xxx-on-options-api-sfcs-that-spread-an-external-props-object-alongside-setup--data--computed--methods)
+  (FIXED in `v0.235.0` by `ubugeeei/vize#1838`): an Options API SFC with
+  `props: { ...<external const> }` **and** `setup() { return { ... } }`
+  **and** `data()` **and** `computed` (using `this.*`) **and** `methods`
+  (using `this.*`) makes `vize check` emit four `TS1xxx` syntax errors
+  (typically `TS1131` / `TS1128` / `TS1109`). The same SFC type-checks
+  cleanly under `vue-tsc --noEmit`.
+- [Repro 14](#repro-14--vize-check-emits-ts1xxx-on-options-api-sfcs-whose-script-section-has-multiple-long-line-comments-before-a-proptype-typed-prop-block)
+  (still reproduces on `v0.235.0`): when a `<script>` section contains
+  several `//` line comments long enough to push the source past a certain
+  column threshold, AND the SFC uses Options API `props: { ... }` with a
+  `PropType<T[]>` entry plus at least one other multi-line object-form
+  prop, `vize check` emits a cascade of `TS1xxx` syntax errors in the
+  props region. The same SFC passes `vue-tsc --noEmit`. The bug count
+  scales with the number of long comment lines.
 
 ## Current issues (v0.134.0)
 
@@ -832,3 +841,109 @@ pnpm --filter app exec vue-tsc --noEmit -p tsconfig.json 2>&1 \
 ### File layout
 
 - [`apps/app/src/OptionsApiPropsSpread.vue`](apps/app/src/OptionsApiPropsSpread.vue) — minimal 5-block reproduction (4 errors under `vize check`, 0 under `vue-tsc`)
+
+---
+
+## Repro 14 — `vize check` emits TS1xxx on Options API SFCs whose `<script>` section has multiple long line comments before a `PropType<T[]>`-typed prop block
+
+Observed against `vize@0.235.0` with
+`@typescript/native-preview@7.0.0-dev.20260602.1`. Repro 13 was fixed in
+the same release, but this distinct virtual-TS generator defect remains.
+
+[`apps/app/src/OptionsApiPropsLongComment.vue`](apps/app/src/OptionsApiPropsLongComment.vue):
+
+```vue
+<script lang="ts">
+import { defineComponent, PropType } from 'vue'
+
+interface Item { id: number }
+
+// long enough comment line one xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// long enough comment line two xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// long enough comment line three xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// long enough comment line four xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// long enough comment line five xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+export default defineComponent({
+  props: {
+    items: {
+      type: Array as PropType<Item[]>,
+      required: false,
+    },
+    size: {
+      type: Number,
+      default: 0,
+    },
+  },
+})
+</script>
+```
+
+Run:
+
+```bash
+pnpm --filter app exec vize check src/OptionsApiPropsLongComment.vue --tsconfig tsconfig.json
+```
+
+### Expected
+
+`No type errors found!` — `vue-tsc --noEmit -p tsconfig.json` reports
+zero errors on this SFC.
+
+### Actual
+
+```
+src/OptionsApiPropsLongComment.vue
+  error:15:22 [TS1005] ';' expected.
+  error:16:18 [TS1005] ';' expected.
+  error:18:1  [TS1109] Expression expected.
+  error:18:2  [TS1128] Declaration or statement expected.
+  error:20:10 [TS1109] Expression expected.
+  error:20:17 [TS1128] Declaration or statement expected.
+  error:22:1  [TS1109] Expression expected.
+  error:22:2  [TS1128] Declaration or statement expected.
+  error:23:1  [TS1128] Declaration or statement expected.
+  error:23:2  [TS1109] Expression expected.
+  error:23:3  [TS1109] Expression expected.
+
+11 error(s)
+```
+
+The reported `line:column` positions point at lines 15-23 of the source
+SFC. Those lines are syntactically valid TypeScript and `vue-tsc` passes
+on them — the column drift looks like the generator is mis-mapping the
+virtual-TS layout back onto the original source when the leading region
+contains multiple long `//` comments.
+
+### Trigger surface (bisected)
+
+All four of the following are required to reproduce. Removing any one
+returns the file to 0 errors:
+
+1. A run of **two or more `//` line comments** in `<script>` where each
+   comment line is wide enough (in this fixture, ≥ ~76 chars). Replacing
+   the comments with **blank lines** of the same count makes the errors
+   disappear, so the trigger is comment width, not file length.
+2. An Options API `export default defineComponent({ ... })` (the bug does
+   not appear with `<script setup>`).
+3. A `props: { ... }` entry whose `type:` uses `Array as PropType<T[]>`
+   (a generic type-assertion in type position). Replacing the entry with
+   `items: { type: Array, required: false }` makes the errors disappear.
+4. **At least one other multi-line object-form prop entry** alongside the
+   `PropType<T[]>` one. Collapsing it to `size: { type: Number, default: 0 }`
+   on a single line makes the errors disappear.
+
+Increasing the number of long comment lines linearly increases the
+diagnostic count (5 lines → 11 errors in this fixture).
+
+### Cross-check — vue-tsc
+
+```bash
+pnpm --filter app exec vue-tsc --noEmit -p tsconfig.json 2>&1 \
+  | grep OptionsApiPropsLongComment
+# (no output — vue-tsc reports no errors for this file)
+```
+
+### File layout
+
+- [`apps/app/src/OptionsApiPropsLongComment.vue`](apps/app/src/OptionsApiPropsLongComment.vue) — minimal reproduction (11 errors under `vize check`, 0 under `vue-tsc`)
