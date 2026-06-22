@@ -16,13 +16,22 @@ several common Options API shapes.
   (typically `TS1131` / `TS1128` / `TS1109`). The same SFC type-checks
   cleanly under `vue-tsc --noEmit`.
 - [Repro 14](#repro-14--vize-check-emits-ts1xxx-on-options-api-sfcs-whose-script-section-has-multiple-long-line-comments-before-a-proptype-typed-prop-block)
-  (still reproduces on `v0.235.0`): when a `<script>` section contains
-  several `//` line comments long enough to push the source past a certain
-  column threshold, AND the SFC uses Options API `props: { ... }` with a
+  (FIXED in `v0.251.0`): when a `<script>` section contains several `//`
+  line comments long enough to push the source past a certain column
+  threshold, AND the SFC uses Options API `props: { ... }` with a
   `PropType<T[]>` entry plus at least one other multi-line object-form
   prop, `vize check` emits a cascade of `TS1xxx` syntax errors in the
   props region. The same SFC passes `vue-tsc --noEmit`. The bug count
-  scales with the number of long comment lines.
+  scaled with the number of long comment lines.
+- [Repro 15](#repro-15--vize-check-no-longer-reports-the-child-component-props-type-mismatch-that-vue-tsc-catches-regression-since-v0235)
+  (regression introduced between `v0.235.0` and `v0.251.0`): a `<script
+  setup>` SFC that binds a `string` value to a child component's
+  `number`-typed prop (`<Child :countTotal="wrong" />` where `wrong:
+  string`) is no longer flagged by `vize check` on `v0.251.0`. The same
+  SFC raised `TS2322 Type 'string' is not assignable to type 'number'`
+  under `vize check` up to `v0.235.0`, matching `vue-tsc --noEmit`. This
+  is a **false-negative regression** — `vize check` now silently passes
+  a real type error that `vue-tsc` continues to catch.
 
 ## Current issues (v0.134.0)
 
@@ -180,8 +189,8 @@ suppress.
 ### File layout
 
 - [`apps/app/src/OptionsApi.vue`](apps/app/src/OptionsApi.vue) — minimal failing case
-- [`apps/app/src/Child.vue`](apps/app/src/Child.vue) — props-defining child (`<script setup>` style, passes)
-- [`apps/app/src/Parent.vue`](apps/app/src/Parent.vue) — uses Child (`<script setup>` style, passes)
+- [`apps/app/src/Child.vue`](apps/app/src/Child.vue) — props-defining child (`<script setup>` style, no Repro 5 error)
+- [`apps/app/src/Parent.vue`](apps/app/src/Parent.vue) — uses Child (`<script setup>` style, no Repro 5 error; also serves as the [Repro 15](#repro-15--vize-check-no-longer-reports-the-child-component-props-type-mismatch-that-vue-tsc-catches-regression-since-v0235) fixture)
 - [`apps/app/vize.config.ts`](apps/app/vize.config.ts) — config kept from historical reproductions
 - [`apps/app/package.json`](apps/app/package.json) — `lint:vize` / `typecheck:vize` scripts
 
@@ -947,3 +956,100 @@ pnpm --filter app exec vue-tsc --noEmit -p tsconfig.json 2>&1 \
 ### File layout
 
 - [`apps/app/src/OptionsApiPropsLongComment.vue`](apps/app/src/OptionsApiPropsLongComment.vue) — minimal reproduction (11 errors under `vize check`, 0 under `vue-tsc`)
+
+---
+
+## Repro 15 — `vize check` no longer reports the child-component props type mismatch that `vue-tsc` catches (regression since v0.235)
+
+Observed against `vize@0.251.0` with
+`@typescript/native-preview@7.0.0-dev.20260602.1`. Up to and including
+`v0.235.0`, `vize check` correctly reported the type mismatch shown below
+(matching `vue-tsc`); on `v0.251.0` it silently passes. This is a
+**false-negative regression** in `vize check`'s template prop-type
+verification.
+
+The fixture reuses the existing [`Parent.vue`](apps/app/src/Parent.vue) /
+[`Child.vue`](apps/app/src/Child.vue) pair (they were originally added as
+the `<script setup>` control case for [Repro 5](#repro-5--vize-check-strips-the-export-keyword-when-generating-virtual-ts-for-options-api-sfc)).
+
+[`apps/app/src/Child.vue`](apps/app/src/Child.vue):
+
+```vue
+<script setup lang="ts">
+const props = defineProps<{ countTotal: number }>();
+</script>
+
+<template>
+  <span>{{ props.countTotal }}</span>
+</template>
+```
+
+[`apps/app/src/Parent.vue`](apps/app/src/Parent.vue):
+
+```vue
+<script setup lang="ts">
+import Child from "./Child.vue";
+
+const wrong: string = "not a number";
+</script>
+
+<template>
+  <Child :countTotal="wrong" />
+</template>
+```
+
+Run:
+
+```bash
+pnpm --filter app exec vize check src/Parent.vue src/Child.vue --tsconfig tsconfig.json
+```
+
+### Expected
+
+`Parent.vue` binds a `string` value to a prop typed `number`. `vue-tsc
+--noEmit -p tsconfig.json` reports:
+
+```
+src/Parent.vue(8,11): error TS2322: Type 'string' is not assignable to type 'number'.
+```
+
+`vize check` should report the same mismatch (and did, up to `v0.235.0`).
+
+### Actual (`v0.251.0`)
+
+```
+No type errors found!
+```
+
+`vize check` exits clean on the same fixture, missing the prop type
+mismatch entirely.
+
+### Cross-version timeline
+
+| vize version | `Parent.vue` `vize check` result | matches `vue-tsc`? |
+| --- | --- | --- |
+| `v0.217.0` | `TS2322` reported at `src/Parent.vue:8:18` | ✅ |
+| `v0.235.0` | `TS2322` reported at `src/Parent.vue:8:18` | ✅ |
+| `v0.251.0` | **no diagnostic** | ❌ (false negative) |
+
+The column drift between `8,11` (vue-tsc, attribute name) and `8:18`
+(prior `vize check`, value expression) is orthogonal to the regression
+itself.
+
+### Why this is severe
+
+The earlier reproductions in this repo (Repros 5–14) describe
+**false-positive** behaviors of `vize check` — `vize check` emits
+diagnostics that `vue-tsc` does not. Those make `vize check` *noisier*
+than `vue-tsc` but not unsafe to gate CI on.
+
+Repro 15 is the opposite: `vize check` **misses** a diagnostic that
+`vue-tsc` reports. Any project that gates CI on `vize check` from
+`v0.236.0` onward will silently accept template prop-type mismatches
+that `vue-tsc` would have flagged.
+
+### File layout
+
+- [`apps/app/src/Parent.vue`](apps/app/src/Parent.vue) — consumer binding `string` to a `number` prop (must fail)
+- [`apps/app/src/Child.vue`](apps/app/src/Child.vue) — child component with `defineProps<{ countTotal: number }>()`
+- [`apps/app/tsconfig.json`](apps/app/tsconfig.json) — shared strict tsconfig
